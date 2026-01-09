@@ -174,3 +174,7 @@ See the server setup documentation for details on configuring your ogit instance
 ## License
 
 MIT
+
+## Acknowledgments
+
+This project was built with significant contributions from [Claude Code](https://claude.ai/claude-code), Anthropic's AI coding assistant.
