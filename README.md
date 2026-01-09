@@ -7,7 +7,9 @@ A CLI tool for managing git repositories on a self-hosted ogit server with Tails
 - **Tailnet-aware access control** - Automatic detection of tailnet connection
 - **SSH read/write access** - Full access when connected via tailnet
 - **HTTPS read-only access** - Public repos accessible externally
-- **Simple commands** - list, clone, create, delete, public, private, status
+- **Static site hosting** - Deploy sites from repos to `{repo}.rafayel.dev`
+- **Git LFS support** - S3-compatible storage for large files
+- **Simple commands** - list, clone, create, delete, public, private, pages, lfs
 
 ## Installation
 
@@ -73,6 +75,85 @@ gitraf public myrepo
 # Make a repository private (requires tailnet)
 gitraf private myrepo
 ```
+
+## Static Site Hosting (Pages)
+
+Deploy static sites from git repositories. Sites are served at `{repo-name}.rafayel.dev`.
+
+```bash
+# Enable pages for a repository
+gitraf pages enable mysite
+# Prompts for: branch, build command, output directory
+
+# List all pages-enabled repos
+gitraf pages list
+
+# Check status of a pages site
+gitraf pages status mysite
+
+# Force deploy (re-run build)
+gitraf pages deploy mysite
+
+# Disable pages
+gitraf pages disable mysite
+```
+
+### Pages Configuration
+
+When enabling pages, you can configure:
+- **Branch**: Which branch to deploy from (default: `main`)
+- **Build command**: Optional command like `npm run build` (leave empty for static files)
+- **Output directory**: Where the built site is (default: `public`)
+
+### Deployment Flow
+
+1. Push to the configured branch
+2. The post-receive hook runs your build command (if configured)
+3. Contents of the output directory are deployed to `{repo}.rafayel.dev`
+
+### Example: Static Site
+
+```bash
+# Create repo with public/ directory
+gitraf create my-blog
+gitraf pages enable my-blog
+# Branch: main, Build: (empty), Output: public
+
+# Push your static files
+git clone git@server:my-blog.git
+cd my-blog
+mkdir public
+echo "<h1>Hello World</h1>" > public/index.html
+git add . && git commit -m "Initial site"
+git push origin main
+
+# Site is now live at https://my-blog.rafayel.dev
+```
+
+### Example: Build with npm
+
+```bash
+gitraf pages enable my-vite-app
+# Branch: main
+# Build: npm run build
+# Output: dist
+
+# Push triggers: npm install → npm run build → deploy dist/
+```
+
+## Git LFS
+
+Configure Git LFS with S3-compatible storage (AWS S3, Cloudflare R2, etc.):
+
+```bash
+# Interactive setup
+gitraf lfs setup
+
+# Check LFS status
+gitraf lfs status
+```
+
+Note: Files over 10MB are rejected unless tracked by LFS.
 
 ## Access Model
 
