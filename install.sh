@@ -2,16 +2,16 @@
 set -e
 
 # gitraf installer
-# Usage: curl -fsSL https://git.rafayel.dev/gitraf.git/raw/main/install.sh | bash
+#
+# Quick install (requires Go 1.21+):
+#   git clone https://git.rafayel.dev/gitraf.git && cd gitraf && ./install.sh
+#
+# Or manually:
+#   git clone https://git.rafayel.dev/gitraf.git
+#   cd gitraf && go build -o gitraf . && sudo mv gitraf /usr/local/bin/
 
 REPO_URL="https://git.rafayel.dev/gitraf.git"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-TMP_DIR=$(mktemp -d)
-
-cleanup() {
-    rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
 
 echo "Installing gitraf..."
 
@@ -31,11 +31,20 @@ if [ "$GO_MAJOR" -lt 1 ] || ([ "$GO_MAJOR" -eq 1 ] && [ "$GO_MINOR" -lt 21 ]); t
     exit 1
 fi
 
-echo "Cloning repository..."
-git clone --quiet "$REPO_URL" "$TMP_DIR/gitraf"
+# Check if running from within the repo
+if [ -f "main.go" ] && [ -f "go.mod" ]; then
+    echo "Building from current directory..."
+    BUILD_DIR="."
+else
+    echo "Cloning repository..."
+    TMP_DIR=$(mktemp -d)
+    trap "rm -rf $TMP_DIR" EXIT
+    git clone --quiet "$REPO_URL" "$TMP_DIR/gitraf"
+    BUILD_DIR="$TMP_DIR/gitraf"
+fi
 
 echo "Building..."
-cd "$TMP_DIR/gitraf"
+cd "$BUILD_DIR"
 go build -o gitraf .
 
 echo "Installing to $INSTALL_DIR..."
