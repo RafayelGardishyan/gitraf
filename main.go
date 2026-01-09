@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -301,21 +300,21 @@ func createCmd() *cobra.Command {
 
 			name := args[0]
 			cfg := loadConfig()
+			host := getSSHHost()
 
-			// Use tailnet URL for API
-			apiURL := "http://" + cfg.TailnetURL
-			payload := map[string]string{"name": name}
-			jsonData, _ := json.Marshal(payload)
+			// Create bare repo via SSH
+			createScript := fmt.Sprintf(`
+sudo mkdir -p /opt/ogit/data/repos/%s.git && \
+cd /opt/ogit/data/repos/%s.git && \
+sudo git init --bare && \
+sudo chown -R git:git /opt/ogit/data/repos/%s.git
+`, name, name, name)
 
-			resp, err := http.Post(apiURL+"/api/repo", "application/json", bytes.NewBuffer(jsonData))
-			if err != nil {
-				return fmt.Errorf("failed to connect to server: %w", err)
-			}
-			defer resp.Body.Close()
-
-			body, _ := io.ReadAll(resp.Body)
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-				return fmt.Errorf("failed to create repository: %s", string(body))
+			sshCmd := exec.Command("ssh", host, createScript)
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to create repository: %w", err)
 			}
 
 			fmt.Printf("Repository '%s' created successfully.\n\n", name)
