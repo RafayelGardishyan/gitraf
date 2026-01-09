@@ -1,6 +1,17 @@
-# gitraf
+<p align="center">
+  <img src="https://git.rafayel.dev/static/logo-header.png" alt="gitraf" width="400">
+</p>
 
-A CLI tool for managing git repositories on a self-hosted ogit server with Tailscale tailnet integration for access control.
+<p align="center">
+  <strong>A CLI tool for managing git repositories on a self-hosted ogit server with Tailscale tailnet integration for access control.</strong>
+</p>
+
+<p align="center">
+  <a href="https://git.rafayel.dev/docs">Documentation</a> •
+  <a href="https://github.com/RafayelGardishyan/gitraf-ecosystem">GitHub</a>
+</p>
+
+---
 
 ## Features
 
