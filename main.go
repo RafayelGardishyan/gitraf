@@ -225,6 +225,7 @@ Examples:
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(lfsCmd())
 	rootCmd.AddCommand(pagesCmd())
+	rootCmd.AddCommand(mirrorCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -1328,5 +1329,379 @@ fi
 	}
 
 	cmd.AddCommand(enableCmd, disableCmd, listCmd, statusCmd, deployCmd, logsCmd)
+	return cmd
+}
+
+func mirrorCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "mirror",
+		Short: "Manage GitHub mirror sync for repositories",
+		Long: `Set up automatic mirroring of repositories to GitHub.
+
+When enabled, repositories are automatically pushed to their GitHub mirror
+on a schedule (via cronjob). This keeps your GitHub mirror in sync with
+your self-hosted git server.
+
+Examples:
+  gitraf mirror enable myrepo git@github.com:user/myrepo.git
+  gitraf mirror disable myrepo
+  gitraf mirror list
+  gitraf mirror sync myrepo
+  gitraf mirror status`,
+	}
+
+	enableCmd := &cobra.Command{
+		Use:   "enable <repo> <github_url>",
+		Short: "Enable GitHub mirroring for a repository",
+		Long: `Enable automatic mirroring of a repository to GitHub.
+
+The GitHub URL should be an SSH URL (git@github.com:user/repo.git).
+Make sure the server has SSH access to push to the GitHub repository.
+
+Example:
+  gitraf mirror enable myrepo git@github.com:username/myrepo.git`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			repoName := args[0]
+			githubURL := args[1]
+
+			// Validate GitHub URL format
+			if !strings.HasPrefix(githubURL, "git@github.com:") && !strings.HasPrefix(githubURL, "https://github.com/") {
+				return fmt.Errorf("invalid GitHub URL. Use format: git@github.com:user/repo.git or https://github.com/user/repo.git")
+			}
+
+			host := getSSHHost()
+
+			// Check if repo exists
+			checkCmd := exec.Command("ssh", host, fmt.Sprintf("test -d /opt/ogit/data/repos/%s.git", repoName))
+			if err := checkCmd.Run(); err != nil {
+				return fmt.Errorf("repository '%s' not found", repoName)
+			}
+
+			// Create mirror config
+			mirrorConfig := fmt.Sprintf(`{"github_url":"%s","enabled":true}`, githubURL)
+
+			// Write config to repo
+			script := fmt.Sprintf(`
+echo '%s' | sudo tee /opt/ogit/data/repos/%s.git/git-mirror.json > /dev/null && \
+sudo chown git:git /opt/ogit/data/repos/%s.git/git-mirror.json
+`, mirrorConfig, repoName, repoName)
+
+			sshCmd := exec.Command("ssh", host, script)
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to enable mirror: %w", err)
+			}
+
+			// Set up the mirror sync script if it doesn't exist
+			setupScript := `
+if [ ! -f /opt/ogit/scripts/mirror-sync.sh ]; then
+    sudo mkdir -p /opt/ogit/scripts
+    sudo tee /opt/ogit/scripts/mirror-sync.sh > /dev/null << 'SCRIPT'
+#!/bin/bash
+# Mirror sync script - pushes repos to their GitHub mirrors
+
+for repo_path in /opt/ogit/data/repos/*.git; do
+    config_file="$repo_path/git-mirror.json"
+    if [ -f "$config_file" ]; then
+        enabled=$(cat "$config_file" | jq -r '.enabled // false')
+        if [ "$enabled" = "true" ]; then
+            github_url=$(cat "$config_file" | jq -r '.github_url')
+            repo_name=$(basename "$repo_path" .git)
+            echo "Syncing $repo_name to $github_url..."
+            cd "$repo_path"
+            git push --mirror "$github_url" 2>&1 || echo "Failed to sync $repo_name"
+        fi
+    fi
+done
+SCRIPT
+    sudo chmod +x /opt/ogit/scripts/mirror-sync.sh
+fi
+`
+			setupCmd := exec.Command("ssh", host, setupScript)
+			setupCmd.Run() // Ignore errors if already exists
+
+			fmt.Printf("Mirror enabled for '%s' -> %s\n\n", repoName, githubURL)
+			fmt.Println("To set up automatic sync, run:")
+			fmt.Println("  gitraf mirror cron enable")
+			fmt.Println()
+			fmt.Println("Or sync manually with:")
+			fmt.Printf("  gitraf mirror sync %s\n", repoName)
+			return nil
+		},
+	}
+
+	disableCmd := &cobra.Command{
+		Use:   "disable <repo>",
+		Short: "Disable GitHub mirroring for a repository",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			repoName := args[0]
+			host := getSSHHost()
+
+			// Remove mirror config
+			rmCmd := exec.Command("ssh", host, fmt.Sprintf("sudo rm -f /opt/ogit/data/repos/%s.git/git-mirror.json", repoName))
+			rmCmd.Stderr = os.Stderr
+			if err := rmCmd.Run(); err != nil {
+				return fmt.Errorf("failed to disable mirror: %w", err)
+			}
+
+			fmt.Printf("Mirror disabled for '%s'.\n", repoName)
+			return nil
+		},
+	}
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List all mirror-enabled repositories",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			// Find all repos with git-mirror.json
+			findCmd := exec.Command("ssh", host, `
+for d in /opt/ogit/data/repos/*.git; do
+    if [ -f "$d/git-mirror.json" ]; then
+        name=$(basename "$d" .git)
+        url=$(cat "$d/git-mirror.json" | jq -r '.github_url')
+        enabled=$(cat "$d/git-mirror.json" | jq -r '.enabled // false')
+        if [ "$enabled" = "true" ]; then
+            echo "$name -> $url"
+        fi
+    fi
+done
+`)
+			output, err := findCmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to list mirrors: %w", err)
+			}
+
+			repos := strings.TrimSpace(string(output))
+			if repos == "" {
+				fmt.Println("No mirror-enabled repositories found.")
+				fmt.Println("\nEnable mirroring with: gitraf mirror enable <repo> <github_url>")
+				return nil
+			}
+
+			fmt.Println("Mirror-enabled repositories:\n")
+			for _, line := range strings.Split(repos, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					fmt.Printf("  %s\n", line)
+				}
+			}
+			return nil
+		},
+	}
+
+	syncCmd := &cobra.Command{
+		Use:   "sync [repo]",
+		Short: "Manually sync repository to GitHub mirror",
+		Long: `Manually trigger a sync of a repository (or all repositories) to GitHub.
+
+If no repository is specified, syncs all mirror-enabled repositories.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			if len(args) == 0 {
+				// Sync all repos
+				fmt.Println("Syncing all mirror-enabled repositories...")
+				syncAllCmd := exec.Command("ssh", host, "sudo /opt/ogit/scripts/mirror-sync.sh")
+				syncAllCmd.Stdout = os.Stdout
+				syncAllCmd.Stderr = os.Stderr
+				return syncAllCmd.Run()
+			}
+
+			repoName := args[0]
+
+			// Check if mirror is enabled
+			checkCmd := exec.Command("ssh", host, fmt.Sprintf("cat /opt/ogit/data/repos/%s.git/git-mirror.json 2>/dev/null", repoName))
+			configOutput, err := checkCmd.Output()
+			if err != nil {
+				return fmt.Errorf("mirror not enabled for '%s'", repoName)
+			}
+
+			var config map[string]interface{}
+			if err := json.Unmarshal(configOutput, &config); err != nil {
+				return fmt.Errorf("failed to parse config: %w", err)
+			}
+
+			githubURL, ok := config["github_url"].(string)
+			if !ok || githubURL == "" {
+				return fmt.Errorf("invalid mirror configuration for '%s'", repoName)
+			}
+
+			fmt.Printf("Syncing %s to %s...\n", repoName, githubURL)
+
+			syncScript := fmt.Sprintf(`
+cd /opt/ogit/data/repos/%s.git && \
+sudo -u git git push --mirror %s
+`, repoName, githubURL)
+
+			sshCmd := exec.Command("ssh", host, syncScript)
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("sync failed: %w", err)
+			}
+
+			fmt.Println("Sync completed successfully!")
+			return nil
+		},
+	}
+
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show mirror sync status and cron schedule",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			fmt.Println("GitHub Mirror Status")
+			fmt.Println("====================\n")
+
+			// Count enabled mirrors
+			countCmd := exec.Command("ssh", host, `
+count=0
+for d in /opt/ogit/data/repos/*.git; do
+    if [ -f "$d/git-mirror.json" ]; then
+        enabled=$(cat "$d/git-mirror.json" | jq -r '.enabled // false')
+        if [ "$enabled" = "true" ]; then
+            count=$((count + 1))
+        fi
+    fi
+done
+echo $count
+`)
+			countOutput, _ := countCmd.Output()
+			count := strings.TrimSpace(string(countOutput))
+			fmt.Printf("Mirror-enabled repos: %s\n", count)
+
+			// Check cron status
+			cronCmd := exec.Command("ssh", host, "crontab -l 2>/dev/null | grep -q mirror-sync && echo 'enabled' || echo 'disabled'")
+			cronOutput, _ := cronCmd.Output()
+			cronStatus := strings.TrimSpace(string(cronOutput))
+			fmt.Printf("Automatic sync:       %s\n", cronStatus)
+
+			if cronStatus == "enabled" {
+				// Show cron schedule
+				schedCmd := exec.Command("ssh", host, "crontab -l 2>/dev/null | grep mirror-sync | awk '{print $1,$2,$3,$4,$5}'")
+				schedOutput, _ := schedCmd.Output()
+				schedule := strings.TrimSpace(string(schedOutput))
+				if schedule != "" {
+					fmt.Printf("Sync schedule:        %s\n", schedule)
+				}
+			}
+
+			return nil
+		},
+	}
+
+	cronCmd := &cobra.Command{
+		Use:   "cron",
+		Short: "Manage automatic mirror sync cronjob",
+	}
+
+	cronEnableCmd := &cobra.Command{
+		Use:   "enable",
+		Short: "Enable automatic mirror sync (hourly by default)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+			reader := bufio.NewReader(os.Stdin)
+
+			fmt.Println("Configure automatic mirror sync\n")
+			fmt.Println("How often should mirrors sync?")
+			fmt.Println("  1) Every hour (recommended)")
+			fmt.Println("  2) Every 6 hours")
+			fmt.Println("  3) Daily (at midnight)")
+			fmt.Println("  4) Custom cron expression")
+			fmt.Print("\nChoice [1]: ")
+
+			choice, _ := reader.ReadString('\n')
+			choice = strings.TrimSpace(choice)
+			if choice == "" {
+				choice = "1"
+			}
+
+			var cronExpr string
+			switch choice {
+			case "1":
+				cronExpr = "0 * * * *"
+			case "2":
+				cronExpr = "0 */6 * * *"
+			case "3":
+				cronExpr = "0 0 * * *"
+			case "4":
+				fmt.Print("Enter cron expression (e.g., '0 */2 * * *' for every 2 hours): ")
+				cronExpr, _ = reader.ReadString('\n')
+				cronExpr = strings.TrimSpace(cronExpr)
+			default:
+				cronExpr = "0 * * * *"
+			}
+
+			// Add cron job
+			cronScript := fmt.Sprintf(`
+(crontab -l 2>/dev/null | grep -v mirror-sync; echo "%s /opt/ogit/scripts/mirror-sync.sh >> /var/log/gitraf-mirror.log 2>&1") | crontab -
+`, cronExpr)
+
+			sshCmd := exec.Command("ssh", host, cronScript)
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to enable cron: %w", err)
+			}
+
+			fmt.Printf("\nAutomatic mirror sync enabled with schedule: %s\n", cronExpr)
+			fmt.Println("Logs will be written to /var/log/gitraf-mirror.log")
+			return nil
+		},
+	}
+
+	cronDisableCmd := &cobra.Command{
+		Use:   "disable",
+		Short: "Disable automatic mirror sync",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			// Remove cron job
+			rmCronCmd := exec.Command("ssh", host, "crontab -l 2>/dev/null | grep -v mirror-sync | crontab -")
+			rmCronCmd.Stderr = os.Stderr
+			if err := rmCronCmd.Run(); err != nil {
+				return fmt.Errorf("failed to disable cron: %w", err)
+			}
+
+			fmt.Println("Automatic mirror sync disabled.")
+			return nil
+		},
+	}
+
+	cronCmd.AddCommand(cronEnableCmd, cronDisableCmd)
+	cmd.AddCommand(enableCmd, disableCmd, listCmd, syncCmd, statusCmd, cronCmd)
 	return cmd
 }
