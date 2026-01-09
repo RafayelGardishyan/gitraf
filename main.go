@@ -280,13 +280,14 @@ func listCmd() *cobra.Command {
 				fmt.Println("Repositories (public only - connect to tailnet for all):\n")
 			}
 
+			httpsURL := getHTTPSURL()
 			for _, repo := range repos {
 				name := strings.TrimSuffix(repo, ".git")
 				fmt.Printf("  %s\n", name)
 				if onTailnet {
 					fmt.Printf("    SSH (R/W):   git@%s:%s.git\n", cfg.TailnetURL, name)
 				}
-				fmt.Printf("    HTTPS (R):   %s/%s.git\n", cfg.PublicURL, name)
+				fmt.Printf("    HTTPS (R):   %s/%s.git\n", httpsURL, name)
 			}
 			fmt.Printf("\nTotal: %d repositories\n", len(repos))
 			return nil
