@@ -223,6 +223,7 @@ Examples:
 	rootCmd.AddCommand(infoCmd())
 	rootCmd.AddCommand(configCmd())
 	rootCmd.AddCommand(updateCmd())
+	rootCmd.AddCommand(lfsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -868,4 +869,166 @@ Your configuration will NOT be affected.`,
 			return nil
 		},
 	}
+}
+
+func lfsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "lfs",
+		Short: "Manage Git LFS configuration",
+	}
+
+	setupCmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Configure Git LFS with S3-compatible storage",
+		Long: `Configure Git LFS to use S3-compatible storage (AWS S3, Cloudflare R2, etc.).
+
+This will prompt for:
+  - S3 endpoint URL (e.g., https://<account-id>.r2.cloudflarestorage.com for R2)
+  - Bucket name
+  - Access Key ID
+  - Secret Access Key
+  - Region (optional, default: auto)`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			reader := bufio.NewReader(os.Stdin)
+
+			fmt.Println("Git LFS Setup")
+			fmt.Println("=============")
+			fmt.Println()
+			fmt.Println("Supported providers: AWS S3, Cloudflare R2, MinIO, Backblaze B2")
+			fmt.Println()
+
+			// Get S3 endpoint
+			fmt.Print("S3 Endpoint URL (e.g., https://<account-id>.r2.cloudflarestorage.com): ")
+			endpoint, _ := reader.ReadString('\n')
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint == "" {
+				return fmt.Errorf("endpoint is required")
+			}
+
+			// Get bucket name
+			fmt.Print("Bucket name: ")
+			bucket, _ := reader.ReadString('\n')
+			bucket = strings.TrimSpace(bucket)
+			if bucket == "" {
+				return fmt.Errorf("bucket name is required")
+			}
+
+			// Get access key
+			fmt.Print("Access Key ID: ")
+			accessKey, _ := reader.ReadString('\n')
+			accessKey = strings.TrimSpace(accessKey)
+			if accessKey == "" {
+				return fmt.Errorf("access key is required")
+			}
+
+			// Get secret key
+			fmt.Print("Secret Access Key: ")
+			secretKey, _ := reader.ReadString('\n')
+			secretKey = strings.TrimSpace(secretKey)
+			if secretKey == "" {
+				return fmt.Errorf("secret key is required")
+			}
+
+			// Get region (optional)
+			fmt.Print("Region (press Enter for 'auto'): ")
+			region, _ := reader.ReadString('\n')
+			region = strings.TrimSpace(region)
+			if region == "" {
+				region = "auto"
+			}
+
+			// Create config JSON
+			lfsConfig := fmt.Sprintf(`{
+  "endpoint": "%s",
+  "bucket": "%s",
+  "access_key": "%s",
+  "secret_key": "%s",
+  "region": "%s"
+}`, endpoint, bucket, accessKey, secretKey, region)
+
+			host := getSSHHost()
+
+			// Write config to server
+			fmt.Println("\nSaving LFS configuration to server...")
+			writeCmd := exec.Command("ssh", host, fmt.Sprintf("sudo tee /opt/ogit/lfs-config.json << 'EOFCONFIG'\n%s\nEOFCONFIG", lfsConfig))
+			writeCmd.Stdout = nil // Suppress output of tee
+			writeCmd.Stderr = os.Stderr
+			if err := writeCmd.Run(); err != nil {
+				return fmt.Errorf("failed to save config: %w", err)
+			}
+
+			// Set permissions
+			chmodCmd := exec.Command("ssh", host, "sudo chmod 600 /opt/ogit/lfs-config.json")
+			chmodCmd.Run()
+
+			// Restart LFS server if running
+			restartCmd := exec.Command("ssh", host, "sudo systemctl restart gitraf-lfs 2>/dev/null || true")
+			restartCmd.Run()
+
+			fmt.Println("\nLFS configuration saved successfully!")
+			fmt.Println()
+			fmt.Println("Next steps:")
+			fmt.Println("  1. The LFS server will be configured automatically")
+			fmt.Println("  2. Track large files with: git lfs track '*.zip' '*.tar.gz' etc.")
+			fmt.Println("  3. Files >10MB will be rejected unless tracked by LFS")
+			return nil
+		},
+	}
+
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show Git LFS configuration status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			// Check if LFS config exists
+			checkCmd := exec.Command("ssh", host, "cat /opt/ogit/lfs-config.json 2>/dev/null")
+			output, err := checkCmd.Output()
+			if err != nil {
+				fmt.Println("LFS Status: Not configured")
+				fmt.Println()
+				fmt.Println("Run 'gitraf lfs setup' to configure Git LFS with S3 storage.")
+				return nil
+			}
+
+			// Parse config to show (hide secrets)
+			var config map[string]string
+			if err := json.Unmarshal(output, &config); err != nil {
+				return fmt.Errorf("failed to parse config: %w", err)
+			}
+
+			fmt.Println("LFS Status: Configured")
+			fmt.Println()
+			fmt.Printf("  Endpoint: %s\n", config["endpoint"])
+			fmt.Printf("  Bucket:   %s\n", config["bucket"])
+			fmt.Printf("  Region:   %s\n", config["region"])
+			if len(config["access_key"]) > 8 {
+				fmt.Printf("  Access Key: %s...\n", config["access_key"][:8])
+			}
+			fmt.Println()
+
+			// Check if LFS server is running
+			svcCmd := exec.Command("ssh", host, "systemctl is-active gitraf-lfs 2>/dev/null || echo 'not running'")
+			svcOutput, _ := svcCmd.Output()
+			svcStatus := strings.TrimSpace(string(svcOutput))
+			if svcStatus == "active" {
+				fmt.Println("  LFS Server: Running")
+			} else {
+				fmt.Println("  LFS Server: Not running (integrated into gitraf-server)")
+			}
+
+			return nil
+		},
+	}
+
+	cmd.AddCommand(setupCmd, statusCmd)
+	return cmd
 }
