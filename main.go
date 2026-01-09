@@ -224,6 +224,7 @@ Examples:
 	rootCmd.AddCommand(configCmd())
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(lfsCmd())
+	rootCmd.AddCommand(pagesCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -1030,5 +1031,302 @@ This will prompt for:
 	}
 
 	cmd.AddCommand(setupCmd, statusCmd)
+	return cmd
+}
+
+func pagesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pages",
+		Short: "Manage static site hosting for repositories",
+		Long: `Deploy static sites from git repositories.
+
+When a repo is enabled for pages, its content is deployed to {repo-name}.rafayel.dev.
+Push to the configured branch to trigger deployment.
+
+Examples:
+  gitraf pages enable my-site       # Enable pages for a repo
+  gitraf pages disable my-site      # Disable pages for a repo
+  gitraf pages list                 # List all pages-enabled repos
+  gitraf pages status my-site       # Show pages status for a repo`,
+	}
+
+	enableCmd := &cobra.Command{
+		Use:   "enable <repo>",
+		Short: "Enable pages for a repository",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			name := args[0]
+			reader := bufio.NewReader(os.Stdin)
+
+			fmt.Printf("Enabling pages for '%s'...\n\n", name)
+
+			// Interactive prompts for config
+			fmt.Print("Branch to deploy from [main]: ")
+			branch, _ := reader.ReadString('\n')
+			branch = strings.TrimSpace(branch)
+			if branch == "" {
+				branch = "main"
+			}
+
+			fmt.Print("Build command (leave empty for static files): ")
+			buildCmd, _ := reader.ReadString('\n')
+			buildCmd = strings.TrimSpace(buildCmd)
+
+			fmt.Print("Output directory [public]: ")
+			outputDir, _ := reader.ReadString('\n')
+			outputDir = strings.TrimSpace(outputDir)
+			if outputDir == "" {
+				outputDir = "public"
+			}
+
+			// Create config JSON - escape any quotes in build command
+			buildCmdEscaped := strings.ReplaceAll(buildCmd, `"`, `\"`)
+			config := fmt.Sprintf(`{"enabled":true,"branch":"%s","build_command":"%s","output_dir":"%s"}`,
+				branch, buildCmdEscaped, outputDir)
+
+			host := getSSHHost()
+
+			// Check if repo exists
+			checkCmd := exec.Command("ssh", host, fmt.Sprintf("test -d /opt/ogit/data/repos/%s.git", name))
+			if err := checkCmd.Run(); err != nil {
+				return fmt.Errorf("repository '%s' not found", name)
+			}
+
+			// Write config and link hook
+			script := fmt.Sprintf(`
+echo '%s' | sudo tee /opt/ogit/data/repos/%s.git/git-pages.json > /dev/null && \
+sudo ln -sf /opt/ogit/hooks/post-receive-pages /opt/ogit/data/repos/%s.git/hooks/post-receive && \
+sudo chown git:git /opt/ogit/data/repos/%s.git/git-pages.json /opt/ogit/data/repos/%s.git/hooks/post-receive
+`, config, name, name, name, name)
+
+			sshCmd := exec.Command("ssh", host, script)
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to enable pages: %w", err)
+			}
+
+			fmt.Printf("\nPages enabled for %s!\n", name)
+			fmt.Printf("URL: https://%s.rafayel.dev\n\n", name)
+			fmt.Printf("Push to the '%s' branch to deploy.\n", branch)
+			return nil
+		},
+	}
+
+	disableCmd := &cobra.Command{
+		Use:   "disable <repo>",
+		Short: "Disable pages for a repository",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			name := args[0]
+			host := getSSHHost()
+
+			// Remove config and unlink hook
+			script := fmt.Sprintf(`
+sudo rm -f /opt/ogit/data/repos/%s.git/git-pages.json && \
+sudo rm -f /opt/ogit/data/repos/%s.git/hooks/post-receive
+`, name, name)
+
+			sshCmd := exec.Command("ssh", host, script)
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to disable pages: %w", err)
+			}
+
+			fmt.Printf("Pages disabled for %s.\n", name)
+			fmt.Println("Note: The deployed site will remain until manually deleted.")
+			return nil
+		},
+	}
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List all pages-enabled repositories",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			// Find all repos with git-pages.json
+			findCmd := exec.Command("ssh", host, "for d in /opt/ogit/data/repos/*.git; do if [ -f \"$d/git-pages.json\" ]; then basename \"$d\" .git; fi; done")
+			output, err := findCmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to list pages: %w", err)
+			}
+
+			repos := strings.TrimSpace(string(output))
+			if repos == "" {
+				fmt.Println("No pages-enabled repositories found.")
+				fmt.Println("\nEnable pages with: gitraf pages enable <repo>")
+				return nil
+			}
+
+			fmt.Println("Pages-enabled repositories:\n")
+			for _, repo := range strings.Split(repos, "\n") {
+				repo = strings.TrimSpace(repo)
+				if repo != "" {
+					fmt.Printf("  %s -> https://%s.rafayel.dev\n", repo, repo)
+				}
+			}
+			return nil
+		},
+	}
+
+	statusCmd := &cobra.Command{
+		Use:   "status [repo]",
+		Short: "Show pages status for a repository",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			if len(args) == 0 {
+				// Show status for all pages
+				findCmd := exec.Command("ssh", host, "for d in /opt/ogit/data/repos/*.git; do if [ -f \"$d/git-pages.json\" ]; then name=$(basename \"$d\" .git); echo \"$name:\"; cat \"$d/git-pages.json\" | jq -r '\"  Branch: \\(.branch // \"main\")\\n  Build: \\(.build_command // \"(none)\")\\n  Output: \\(.output_dir // \"public\")\"'; echo; fi; done")
+				output, err := findCmd.Output()
+				if err != nil {
+					return fmt.Errorf("failed to get status: %w", err)
+				}
+				if strings.TrimSpace(string(output)) == "" {
+					fmt.Println("No pages-enabled repositories.")
+					return nil
+				}
+				fmt.Print(string(output))
+				return nil
+			}
+
+			name := args[0]
+
+			// Check if pages is enabled
+			checkCmd := exec.Command("ssh", host, fmt.Sprintf("cat /opt/ogit/data/repos/%s.git/git-pages.json 2>/dev/null", name))
+			output, err := checkCmd.Output()
+			if err != nil {
+				fmt.Printf("Pages not enabled for '%s'.\n", name)
+				fmt.Println("\nEnable with: gitraf pages enable", name)
+				return nil
+			}
+
+			// Parse and display config
+			var config map[string]interface{}
+			if err := json.Unmarshal(output, &config); err != nil {
+				return fmt.Errorf("failed to parse config: %w", err)
+			}
+
+			branch := "main"
+			if b, ok := config["branch"].(string); ok && b != "" {
+				branch = b
+			}
+			buildCmd := "(none)"
+			if b, ok := config["build_command"].(string); ok && b != "" {
+				buildCmd = b
+			}
+			outputDir := "public"
+			if o, ok := config["output_dir"].(string); ok && o != "" {
+				outputDir = o
+			}
+
+			fmt.Printf("Pages Status: %s\n", name)
+			fmt.Println("===================")
+			fmt.Printf("URL:          https://%s.rafayel.dev\n", name)
+			fmt.Printf("Branch:       %s\n", branch)
+			fmt.Printf("Build:        %s\n", buildCmd)
+			fmt.Printf("Output Dir:   %s\n", outputDir)
+
+			// Check if site is deployed
+			checkDeployCmd := exec.Command("ssh", host, fmt.Sprintf("test -d /opt/ogit/pages/%s/site && echo 'deployed' || echo 'not deployed'", name))
+			deployOutput, _ := checkDeployCmd.Output()
+			fmt.Printf("Deployed:     %s\n", strings.TrimSpace(string(deployOutput)))
+
+			return nil
+		},
+	}
+
+	deployCmd := &cobra.Command{
+		Use:   "deploy <repo>",
+		Short: "Force deploy a pages-enabled repository",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			name := args[0]
+			host := getSSHHost()
+
+			// Check if pages is enabled
+			checkCmd := exec.Command("ssh", host, fmt.Sprintf("cat /opt/ogit/data/repos/%s.git/git-pages.json 2>/dev/null", name))
+			configOutput, err := checkCmd.Output()
+			if err != nil {
+				return fmt.Errorf("pages not enabled for '%s'", name)
+			}
+
+			var config map[string]interface{}
+			if err := json.Unmarshal(configOutput, &config); err != nil {
+				return fmt.Errorf("failed to parse config: %w", err)
+			}
+
+			branch := "main"
+			if b, ok := config["branch"].(string); ok && b != "" {
+				branch = b
+			}
+
+			fmt.Printf("Deploying %s from branch %s...\n", name, branch)
+
+			// Trigger deployment by running the hook manually
+			script := fmt.Sprintf(`
+cd /opt/ogit/data/repos/%s.git && \
+echo "0000000 HEAD refs/heads/%s" | sudo -u git /opt/ogit/hooks/post-receive-pages
+`, name, branch)
+
+			sshCmd := exec.Command("ssh", host, script)
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			return sshCmd.Run()
+		},
+	}
+
+	logsCmd := &cobra.Command{
+		Use:   "logs <repo>",
+		Short: "Show recent deploy output for a repository",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			name := args[0]
+			host := getSSHHost()
+
+			// Check if site directory exists and show info
+			script := fmt.Sprintf(`
+if [ -d /opt/ogit/pages/%s/site ]; then
+    echo "Site directory: /opt/ogit/pages/%s/site"
+    echo "Contents:"
+    ls -la /opt/ogit/pages/%s/site 2>/dev/null | head -20
+else
+    echo "No deployment found for %s"
+fi
+`, name, name, name, name)
+
+			sshCmd := exec.Command("ssh", host, script)
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			return sshCmd.Run()
+		},
+	}
+
+	cmd.AddCommand(enableCmd, disableCmd, listCmd, statusCmd, deployCmd, logsCmd)
 	return cmd
 }
