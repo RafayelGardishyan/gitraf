@@ -184,7 +184,12 @@ func getSSHHost() string {
 // getHTTPSURL returns the public HTTPS URL
 func getHTTPSURL() string {
 	cfg := loadConfig()
-	return strings.TrimSuffix(cfg.PublicURL, "/")
+	url := strings.TrimSuffix(cfg.PublicURL, "/")
+	// Ensure https:// prefix
+	if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = "https://" + url
+	}
+	return url
 }
 
 func main() {
@@ -805,10 +810,15 @@ Your configuration will NOT be affected.`,
 			// Clone the repo
 			fmt.Println("Downloading latest version...")
 			cfg := loadConfig()
-			repoURL := "https://git.rafayel.dev/gitraf.git"
-			if cfg.PublicURL != "" {
-				repoURL = cfg.PublicURL + "/gitraf.git"
+			publicURL := cfg.PublicURL
+			if publicURL == "" {
+				publicURL = "https://git.rafayel.dev"
 			}
+			// Ensure https:// prefix
+			if !strings.HasPrefix(publicURL, "http://") && !strings.HasPrefix(publicURL, "https://") {
+				publicURL = "https://" + publicURL
+			}
+			repoURL := publicURL + "/gitraf.git"
 
 			cloneCmd := exec.Command("git", "clone", "--quiet", repoURL, filepath.Join(tmpDir, "gitraf"))
 			cloneCmd.Stdout = os.Stdout
