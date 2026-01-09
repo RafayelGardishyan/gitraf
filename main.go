@@ -217,6 +217,7 @@ Examples:
 	rootCmd.AddCommand(cloneCmd())
 	rootCmd.AddCommand(infoCmd())
 	rootCmd.AddCommand(configCmd())
+	rootCmd.AddCommand(updateCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -766,4 +767,94 @@ func configCmd() *cobra.Command {
 
 	cmd.AddCommand(setCmd, getCmd, showCmd, initCmd)
 	return cmd
+}
+
+func updateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "update",
+		Short: "Update gitraf to the latest version",
+		Long: `Update gitraf to the latest version from the git repository.
+This will download, build, and install the latest version.
+Your configuration will NOT be affected.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Check for Go
+			if _, err := exec.LookPath("go"); err != nil {
+				return fmt.Errorf("Go is required for updates. Install from https://go.dev/doc/install")
+			}
+
+			// Get current binary path
+			execPath, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("failed to get executable path: %w", err)
+			}
+			execPath, err = filepath.EvalSymlinks(execPath)
+			if err != nil {
+				return fmt.Errorf("failed to resolve executable path: %w", err)
+			}
+
+			fmt.Println("Updating gitraf...")
+			fmt.Printf("Binary location: %s\n", execPath)
+
+			// Create temp directory
+			tmpDir, err := os.MkdirTemp("", "gitraf-update-")
+			if err != nil {
+				return fmt.Errorf("failed to create temp directory: %w", err)
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Clone the repo
+			fmt.Println("Downloading latest version...")
+			cfg := loadConfig()
+			repoURL := "https://git.rafayel.dev/gitraf.git"
+			if cfg.PublicURL != "" {
+				repoURL = cfg.PublicURL + "/gitraf.git"
+			}
+
+			cloneCmd := exec.Command("git", "clone", "--quiet", repoURL, filepath.Join(tmpDir, "gitraf"))
+			cloneCmd.Stdout = os.Stdout
+			cloneCmd.Stderr = os.Stderr
+			if err := cloneCmd.Run(); err != nil {
+				return fmt.Errorf("failed to clone repository: %w", err)
+			}
+
+			// Build
+			fmt.Println("Building...")
+			buildCmd := exec.Command("go", "build", "-o", "gitraf", ".")
+			buildCmd.Dir = filepath.Join(tmpDir, "gitraf")
+			buildCmd.Stdout = os.Stdout
+			buildCmd.Stderr = os.Stderr
+			if err := buildCmd.Run(); err != nil {
+				return fmt.Errorf("failed to build: %w", err)
+			}
+
+			// Replace binary
+			fmt.Println("Installing...")
+			newBinary := filepath.Join(tmpDir, "gitraf", "gitraf")
+
+			// Copy new binary to old location
+			input, err := os.ReadFile(newBinary)
+			if err != nil {
+				return fmt.Errorf("failed to read new binary: %w", err)
+			}
+
+			if err := os.WriteFile(execPath, input, 0755); err != nil {
+				// Try with sudo if permission denied
+				if os.IsPermission(err) {
+					fmt.Println("Permission denied, trying with sudo...")
+					cpCmd := exec.Command("sudo", "cp", newBinary, execPath)
+					cpCmd.Stdout = os.Stdout
+					cpCmd.Stderr = os.Stderr
+					if err := cpCmd.Run(); err != nil {
+						return fmt.Errorf("failed to install (even with sudo): %w", err)
+					}
+				} else {
+					return fmt.Errorf("failed to install: %w", err)
+				}
+			}
+
+			fmt.Println("\ngitraf updated successfully!")
+			fmt.Println("Your configuration has been preserved.")
+			return nil
+		},
+	}
 }

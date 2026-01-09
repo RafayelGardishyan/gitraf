@@ -27,6 +27,13 @@ go build -o gitraf .
 sudo mv gitraf /usr/local/bin/
 ```
 
+## Updating
+
+Update to the latest version (config is preserved):
+```bash
+gitraf update
+```
+
 ## Configuration
 
 Initialize with your server URLs:
