@@ -226,6 +226,7 @@ Examples:
 	rootCmd.AddCommand(lfsCmd())
 	rootCmd.AddCommand(pagesCmd())
 	rootCmd.AddCommand(mirrorCmd())
+	rootCmd.AddCommand(backupCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -1703,5 +1704,200 @@ echo $count
 
 	cronCmd.AddCommand(cronEnableCmd, cronDisableCmd)
 	cmd.AddCommand(enableCmd, disableCmd, listCmd, syncCmd, statusCmd, cronCmd)
+	return cmd
+}
+
+func backupCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backup",
+		Short: "Manage repository backups to S3-compatible storage",
+	}
+
+	runCmd := &cobra.Command{
+		Use:   "run",
+		Short: "Run a backup now",
+		Long:  "Trigger an immediate backup of all repositories to S3-compatible storage.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			dryRun, _ := cmd.Flags().GetBool("dry-run")
+			host := getSSHHost()
+
+			fmt.Println("Starting backup...")
+
+			var sshCmd *exec.Cmd
+			if dryRun {
+				sshCmd = exec.Command("ssh", host, "sudo /opt/ogit/backup/s3-backup.sh --dry-run")
+			} else {
+				sshCmd = exec.Command("ssh", host, "sudo /opt/ogit/backup/s3-backup.sh")
+			}
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("backup failed: %w", err)
+			}
+
+			return nil
+		},
+	}
+	runCmd.Flags().Bool("dry-run", false, "Show what would be backed up without actually uploading")
+
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show backup status",
+		Long:  "Display the status of the backup system including last run time and schedule.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+
+			fmt.Println("Backup Status")
+			fmt.Println("=============")
+			fmt.Println()
+
+			// Check if backup script exists
+			checkCmd := exec.Command("ssh", host, "test -f /opt/ogit/backup/s3-backup.sh && echo 'installed' || echo 'not installed'")
+			output, err := checkCmd.Output()
+			if err != nil || strings.TrimSpace(string(output)) != "installed" {
+				fmt.Println("Status: NOT INSTALLED")
+				fmt.Println("\nRun the deployment script to install the backup system.")
+				return nil
+			}
+			fmt.Println("Status: Installed")
+
+			// Check cron status
+			cronCmd := exec.Command("ssh", host, "cat /etc/cron.d/gitraf-backup 2>/dev/null || echo 'no cron'")
+			cronOutput, _ := cronCmd.Output()
+			if strings.Contains(string(cronOutput), "no cron") {
+				fmt.Println("Schedule: Not scheduled")
+			} else {
+				fmt.Println("Schedule: Daily at midnight (00:00)")
+			}
+
+			// Check last backup log
+			logCmd := exec.Command("ssh", host, "ls -t /var/log/gitraf-backup/*.log 2>/dev/null | head -1 | xargs tail -5 2>/dev/null || echo 'No logs found'")
+			logOutput, _ := logCmd.Output()
+			fmt.Println("\nRecent Log:")
+			fmt.Println(strings.TrimSpace(string(logOutput)))
+
+			// Check backup config
+			fmt.Println("\nConfiguration:")
+			configCmd := exec.Command("ssh", host, "grep -E '^S3_BUCKET|^AWS_ENDPOINT' /opt/ogit/backup/backup.conf 2>/dev/null || echo 'Config not found'")
+			configOutput, _ := configCmd.Output()
+			fmt.Println(strings.TrimSpace(string(configOutput)))
+
+			return nil
+		},
+	}
+
+	listCmd := &cobra.Command{
+		Use:   "list [repo]",
+		Short: "List backups in S3",
+		Long:  "List available backups stored in S3. Optionally filter by repository name.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			host := getSSHHost()
+			repoFilter := ""
+			if len(args) > 0 {
+				repoFilter = args[0]
+			}
+
+			// Get bucket and prefix from config
+			var listScript string
+			if repoFilter != "" {
+				listScript = fmt.Sprintf(`
+source /opt/ogit/backup/backup.conf
+aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/%s/" --profile "${AWS_PROFILE}" ${AWS_ENDPOINT_URL:+--endpoint-url "$AWS_ENDPOINT_URL"} 2>/dev/null | tail -20
+`, repoFilter)
+			} else {
+				listScript = `
+source /opt/ogit/backup/backup.conf
+aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" --profile "${AWS_PROFILE}" ${AWS_ENDPOINT_URL:+--endpoint-url "$AWS_ENDPOINT_URL"} 2>/dev/null
+`
+			}
+
+			sshCmd := exec.Command("ssh", host, listScript)
+			sshCmd.Stdout = os.Stdout
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to list backups: %w", err)
+			}
+
+			return nil
+		},
+	}
+
+	configureCmd := &cobra.Command{
+		Use:   "configure",
+		Short: "Configure backup settings",
+		Long:  "Interactive configuration for S3-compatible backup storage.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireTailnet(); err != nil {
+				return err
+			}
+
+			reader := bufio.NewReader(os.Stdin)
+			host := getSSHHost()
+
+			fmt.Println("Backup Configuration")
+			fmt.Println("====================")
+			fmt.Println()
+			fmt.Println("Configure S3-compatible storage for repository backups.")
+			fmt.Println("Supported: AWS S3, Cloudflare R2, MinIO, Backblaze B2")
+			fmt.Println()
+
+			// Get S3 endpoint
+			fmt.Print("S3 Endpoint URL (leave empty for AWS S3): ")
+			endpoint, _ := reader.ReadString('\n')
+			endpoint = strings.TrimSpace(endpoint)
+
+			// Get bucket name
+			fmt.Print("Bucket name: ")
+			bucket, _ := reader.ReadString('\n')
+			bucket = strings.TrimSpace(bucket)
+			if bucket == "" {
+				return fmt.Errorf("bucket name is required")
+			}
+
+			// Get AWS profile
+			fmt.Print("AWS CLI profile name [r2-backup]: ")
+			profile, _ := reader.ReadString('\n')
+			profile = strings.TrimSpace(profile)
+			if profile == "" {
+				profile = "r2-backup"
+			}
+
+			// Update config on server
+			updateScript := fmt.Sprintf(`
+sudo sed -i 's|^S3_BUCKET=.*|S3_BUCKET="%s"|' /opt/ogit/backup/backup.conf
+sudo sed -i 's|^AWS_PROFILE=.*|AWS_PROFILE="%s"|' /opt/ogit/backup/backup.conf
+`, bucket, profile)
+
+			if endpoint != "" {
+				updateScript += fmt.Sprintf(`sudo sed -i 's|^AWS_ENDPOINT_URL=.*|AWS_ENDPOINT_URL="%s"|' /opt/ogit/backup/backup.conf
+sudo sed -i 's|^#AWS_ENDPOINT_URL=.*|AWS_ENDPOINT_URL="%s"|' /opt/ogit/backup/backup.conf
+`, endpoint, endpoint)
+			}
+
+			sshCmd := exec.Command("ssh", host, updateScript)
+			sshCmd.Stderr = os.Stderr
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to update config: %w", err)
+			}
+
+			fmt.Println("\nConfiguration updated!")
+			fmt.Println("Test with: gitraf backup run --dry-run")
+			return nil
+		},
+	}
+
+	cmd.AddCommand(runCmd, statusCmd, listCmd, configureCmd)
 	return cmd
 }
